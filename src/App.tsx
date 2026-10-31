@@ -1,13 +1,10 @@
-import { FormEvent, useEffect, useRef, useState } from 'react'
+import { FormEvent, useEffect, useState } from 'react'
 import {
   API_BASE,
   apiRequest,
-  beginCognitoLogin,
-  beginCognitoLogout,
   Campus,
   clearSession,
-  DEMO_AUTH_ENABLED,
-  finishCognitoLogin,
+  LOCAL_AUTH_ENABLED,
   getAccessToken,
   getDemoRole,
   getSelectedCampus,
@@ -16,16 +13,13 @@ import {
 } from './auth'
 
 type ApiState = 'checking' | 'online' | 'offline'
-type Membership = { tenant_code: string; tenant_name: string; role: Role }
 type LoginResponse = { access_token: string; role: Role; tenant: Campus }
 type RegistrationResponse = {
-  status: 'registered' | 'confirmation_required'
+  status: 'registered'
   message: string
-  access_token?: string
-  role?: Role
-  tenant?: Campus
-  email?: string
-  confirmation_required?: boolean
+  access_token: string
+  role: Role
+  tenant: Campus
 }
 type Analytics = {
   tenant_name: string
@@ -71,14 +65,10 @@ function App() {
   const [welcomeMessage, setWelcomeMessage] = useState('')
   const [registrationError, setRegistrationError] = useState('')
   const [registrationMessage, setRegistrationMessage] = useState('')
-  const [confirmationEmail, setConfirmationEmail] = useState('')
-  const [registrationConfirmed, setRegistrationConfirmed] = useState(false)
-  const [callbackError, setCallbackError] = useState('')
   const [dashboardError, setDashboardError] = useState('')
   const [analytics, setAnalytics] = useState<Analytics | null>(null)
   const [platformSummary, setPlatformSummary] = useState<PlatformSummary>([])
   const [section, setSection] = useState('overview')
-  const callbackTask = useRef<Promise<{ token: string; campus: Campus; role: Role }> | null>(null)
 
   const navigate = (destination: string) => {
     const pathname = destination.split('?')[0]
@@ -117,41 +107,6 @@ function App() {
       .then((result) => { if (active) setCampuses(result) })
       .catch((error: Error) => { if (active) setCampusError(error.message) })
       .finally(() => { if (active) setCampusLoading(false) })
-    return () => { active = false }
-  }, [path])
-
-  useEffect(() => {
-    if (path !== '/auth/callback') return
-    let active = true
-    callbackTask.current ??= (async () => {
-      const tokens = await finishCognitoLogin()
-      await apiRequest<{ completed: boolean }>('/auth/complete-registration', {
-        method: 'POST',
-        accessToken: tokens.accessToken,
-        body: JSON.stringify({ id_token: tokens.idToken }),
-      })
-      const token = tokens.accessToken
-      const memberships = await apiRequest<Membership[]>('/me/memberships', { accessToken: token })
-      const selected = getSelectedCampus()
-      if (!selected) throw new Error('Choose a campus before signing in.')
-      const membership = memberships.find((item) => item.tenant_code === selected.tenant_code)
-      const platformAdmin = memberships.find((item) => item.role === 'platform_admin')
-      const userRole = membership?.role ?? (platformAdmin ? 'platform_admin' : null)
-      if (!userRole) throw new Error('Your account does not have access to this campus.')
-      return { token, campus: selected, role: userRole }
-    })()
-    void callbackTask.current
-      .then((session) => {
-        if (!active) return
-        storeSession(session.token, session.campus, session.role)
-        setAccessToken(session.token)
-        setCampus(session.campus)
-        setRole(session.role)
-        navigate('/dashboard')
-      })
-      .catch((error: unknown) => {
-        if (active) setCallbackError(error instanceof Error ? error.message : 'Sign-in could not be completed.')
-      })
     return () => { active = false }
   }, [path])
 
@@ -203,20 +158,11 @@ function App() {
       return
     }
 
-    if (!DEMO_AUTH_ENABLED) {
-      try {
-        await beginCognitoLogin(campus)
-      } catch (error) {
-        setLoginError(error instanceof Error ? error.message : 'Sign-in could not be started.')
-      }
-      return
-    }
-
     const form = new FormData(event.currentTarget)
     const email = String(form.get('email') ?? '').trim().toLowerCase()
     const password = String(form.get('password') ?? '')
     try {
-      const result = await apiRequest<LoginResponse>('/auth/demo-login', {
+      const result = await apiRequest<LoginResponse>('/auth/login', {
         method: 'POST',
         body: JSON.stringify({ email, password, tenant_code: campus.tenant_code }),
       })
@@ -234,7 +180,6 @@ function App() {
     event.preventDefault()
     setRegistrationError('')
     setRegistrationMessage('')
-    setRegistrationConfirmed(false)
     if (!campus) {
       navigate('/campuses')
       return
@@ -257,50 +202,24 @@ function App() {
         method: 'POST',
         body: JSON.stringify(payload),
       })
-      if (DEMO_AUTH_ENABLED && result.access_token && result.tenant && result.role) {
-        storeSession(result.access_token, result.tenant, result.role)
-        setAccessToken(result.access_token)
-        setCampus(result.tenant)
-        setRole(result.role)
-        setWelcomeMessage(result.message)
-        navigate('/dashboard')
-        return
-      }
-      setConfirmationEmail(result.email ?? payload.email)
+      storeSession(result.access_token, result.tenant, result.role)
+      setAccessToken(result.access_token)
+      setCampus(result.tenant)
+      setRole(result.role)
+      setWelcomeMessage(result.message)
       setRegistrationMessage(result.message)
-      if (!result.confirmation_required) setRegistrationConfirmed(true)
+      navigate('/dashboard')
     } catch (error) {
       setRegistrationError(error instanceof Error ? error.message : 'Registration could not be completed.')
     }
   }
 
-  const confirmRegistration = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    setRegistrationError('')
-    const form = new FormData(event.currentTarget)
-    const confirmationCode = String(form.get('confirmation_code') ?? '').trim()
-    try {
-      const result = await apiRequest<{ message: string }>('/auth/confirm-registration', {
-        method: 'POST',
-        body: JSON.stringify({ email: confirmationEmail, confirmation_code: confirmationCode }),
-      })
-      setRegistrationMessage(result.message)
-      setRegistrationConfirmed(true)
-    } catch (error) {
-      setRegistrationError(error instanceof Error ? error.message : 'The confirmation code could not be verified.')
-    }
-  }
-
   const signOut = () => {
-    const useCognito = !DEMO_AUTH_ENABLED && Boolean(import.meta.env.VITE_COGNITO_DOMAIN && import.meta.env.VITE_COGNITO_CLIENT_ID)
     clearSession()
     setAccessToken(null)
     setCampus(null)
     setRole(null)
     setAnalytics(null)
-    if (useCognito) {
-      try { beginCognitoLogout(); return } catch { /* Return to the landing page if Cognito is unavailable. */ }
-    }
     navigate('/')
   }
 
@@ -316,7 +235,7 @@ function App() {
         <button className="brand-button" onClick={() => navigate('/')} aria-label="CampusCloud home">
           <span className="brand-mark">C</span><span>CampusCloud</span>
         </button>
-        <span className="environment">{DEMO_AUTH_ENABLED ? 'LOCAL DEMO' : 'SECURE CAMPUS ACCESS'}</span>
+        <span className="environment">{LOCAL_AUTH_ENABLED ? 'CAMPUS ACCOUNT ACCESS' : 'AUTHENTICATION UNAVAILABLE'}</span>
         {path !== '/dashboard' && <a className="top-signin" href="/campuses" onClick={(event) => { event.preventDefault(); navigate('/campuses') }}>Sign In</a>}
       </header>
 
@@ -367,7 +286,7 @@ function App() {
             <h1 className="page-title">Sign in to your <em>campus.</em></h1>
             <p className="selected-campus">{campus?.name ?? 'Select a campus to continue'}</p>
             {loginNotice && <p className="success-message" role="status">{loginNotice}</p>}
-            {DEMO_AUTH_ENABLED ? (
+            {LOCAL_AUTH_ENABLED ? (
               <form className="login-form" onSubmit={(event) => { void signIn(event) }}>
                 <label htmlFor="email">Email address</label>
                 <input id="email" name="email" type="email" autoComplete="username" placeholder="you@college.edu" required />
@@ -375,16 +294,10 @@ function App() {
                 <input id="password" name="password" type="password" autoComplete="current-password" placeholder="Enter your password" required />
                 {loginError && <ErrorMessage>{loginError}</ErrorMessage>}
                 <button className="primary-button full-width" type="submit">Sign In <span aria-hidden="true">→</span></button>
-                <p className="demo-note">Local demo access is enabled. Use one of the demo accounts in the project README.</p>
+                <p className="demo-note">Sign in with the account provisioned for your campus.</p>
               </form>
             ) : (
-              <div className="hosted-login">
-                <p>Sign in securely with your institution account. Your email and password are entered on the Cognito sign-in page.</p>
-                {loginError && <ErrorMessage>{loginError}</ErrorMessage>}
-                <button className="primary-button full-width" onClick={() => { void beginCognitoLogin(campus as Campus).catch((error: Error) => setLoginError(error.message)) }}>
-                  Continue with secure sign-in <span aria-hidden="true">→</span>
-                </button>
-              </div>
+              <ErrorMessage>Campus account sign-in is not configured for this application build.</ErrorMessage>
             )}
             <p className="account-switch">New to CampusCloud? <a href="/register" onClick={(event) => { event.preventDefault(); navigate('/register') }}>Create Account</a></p>
           </div>
@@ -402,20 +315,7 @@ function App() {
             {!campus && <button className="secondary-button full-width" onClick={() => navigate('/campuses')}>Choose a campus</button>}
             {registrationMessage && <p className="success-message" role="status">{registrationMessage}</p>}
             {registrationError && <ErrorMessage>{registrationError}</ErrorMessage>}
-            {registrationConfirmed ? (
-              <div className="registration-confirmed">
-                <p className="confirmation-check" aria-hidden="true">✓</p>
-                <p>Your email is confirmed. Sign in to finish setting up your student campus access.</p>
-                <button className="primary-button full-width" onClick={() => { setLoginNotice('Registration verified. Sign in to open your student dashboard.'); navigate('/login') }}>Return to Sign In <span aria-hidden="true">→</span></button>
-              </div>
-            ) : confirmationEmail ? (
-              <form className="login-form" onSubmit={(event) => { void confirmRegistration(event) }}>
-                <p className="confirmation-copy">Enter the confirmation code sent to <strong>{confirmationEmail}</strong>.</p>
-                <label htmlFor="confirmation_code">Email confirmation code</label>
-                <input id="confirmation_code" name="confirmation_code" inputMode="numeric" autoComplete="one-time-code" required />
-                <button className="primary-button full-width" type="submit">Verify Email <span aria-hidden="true">→</span></button>
-              </form>
-            ) : campus && (
+            {campus && (
               <form className="login-form" onSubmit={(event) => { void register(event) }}>
                 <label htmlFor="full_name">Full name</label>
                 <input id="full_name" name="full_name" type="text" autoComplete="name" maxLength={200} required />
@@ -431,15 +331,6 @@ function App() {
               </form>
             )}
             <p className="account-switch">Already registered? <a href="/login" onClick={(event) => { event.preventDefault(); navigate('/login') }}>Sign In</a></p>
-          </div>
-        </section>
-      )}
-
-      {path === '/auth/callback' && (
-        <section className="journey-page callback-page">
-          <div className="login-card">
-            <p className="eyebrow">SECURE SIGN-IN</p>
-            {callbackError ? <><h1 className="page-title">We couldn’t finish <em>signing in.</em></h1><ErrorMessage>{callbackError}</ErrorMessage><button className="secondary-button" onClick={() => navigate('/login')}>Return to sign in</button></> : <><h1 className="page-title">Verifying your <em>account…</em></h1><p className="page-intro">Please wait while we securely connect your campus account.</p></>}
           </div>
         </section>
       )}
